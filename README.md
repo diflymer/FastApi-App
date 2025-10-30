@@ -29,7 +29,12 @@ git clone <ваш-репозиторий>
 cd fastapi-glossary
 ```
 
-2. **Активируйте виртуальное окружение:**
+2. **Создайте виртуальное окружение:**
+```bash
+python -m venv venv
+```
+
+3. **Активируйте виртуальное окружение:**
 ```bash
 # Для Windows:
 venv\Scripts\activate
@@ -38,12 +43,12 @@ venv\Scripts\activate
 source venv/bin/activate
 ```
 
-3. **Установите зависимости:**
+4. **Установите зависимости:**
 ```bash
 pip install -r requirements.txt
 ```
 
-4. **Запустите приложение:**
+5. **Запустите приложение:**
 ```bash
 uvicorn main:app --reload
 ```
