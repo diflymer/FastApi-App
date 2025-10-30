@@ -25,7 +25,7 @@ API для управления глоссарием терминов ВКР, р
 
 1. **Клонируйте репозиторий:**
 ```bash
-git clone <ваш-репозиторий>
+git clone https://github.com/diflymer/FastApi-App.git
 cd fastapi-glossary
 ```
 
