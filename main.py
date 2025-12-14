@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, or_
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, relationship
 from typing import List
-import os
+# ИМПОРТИРУЕМ CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 # Создание подключения к SQLite базе данных
 DATABASE_URL = "sqlite:///./glossary.db"
@@ -20,6 +21,41 @@ class TermModel(Base):
     name = Column(String, unique=True, index=True, nullable=False)
     definition = Column(Text, nullable=False)
 
+    # Связи, где термин является источником или целью
+    relationships_from = relationship(
+        "TermRelationshipModel",
+        foreign_keys="TermRelationshipModel.from_term_id",
+        back_populates="from_term",
+        cascade="all, delete-orphan",
+    )
+    relationships_to = relationship(
+        "TermRelationshipModel",
+        foreign_keys="TermRelationshipModel.to_term_id",
+        back_populates="to_term",
+        cascade="all, delete-orphan",
+    )
+
+    @property
+    def relations(self):
+        """Исходящие связи термина (для сериализации в ответе)."""
+        return self.relationships_from
+
+
+class TermRelationshipModel(Base):
+    __tablename__ = "term_relationships"
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_term_id = Column(Integer, ForeignKey("terms.id", ondelete="CASCADE"), nullable=False)
+    to_term_id = Column(Integer, ForeignKey("terms.id", ondelete="CASCADE"), nullable=False)
+    relation_type = Column(String, nullable=False)
+
+    from_term = relationship("TermModel", foreign_keys=[from_term_id], back_populates="relationships_from")
+    to_term = relationship("TermModel", foreign_keys=[to_term_id], back_populates="relationships_to")
+
+    @property
+    def target_name(self):
+        return self.to_term.name if self.to_term else None
+
 # Pydantic модели для API
 class Term(BaseModel):
     name: str
@@ -28,8 +64,22 @@ class Term(BaseModel):
 class TermUpdate(BaseModel):
     definition: str
 
+
+class TermRelationCreate(BaseModel):
+    target_name: str
+    relation_type: str
+
+
+class TermRelationResponse(BaseModel):
+    relation_type: str
+    target_name: str
+
+    class Config:
+        from_attributes = True
+
 class TermResponse(Term):
     id: int
+    relations: List[TermRelationResponse] = []
 
     class Config:
         from_attributes = True
@@ -51,7 +101,40 @@ def init_database():
             for term in initial_terms:
                 db.add(term)
             db.commit()
-            print("База данных инициализирована начальными данными")
+
+            # Добавляем связи между терминами
+            initial_relations = [
+                # MP связан с MiniApps как "синоним"
+                TermRelationshipModel(from_term_id=db.query(TermModel).filter(TermModel.name == "MP").first().id,
+                                    to_term_id=db.query(TermModel).filter(TermModel.name == "MiniApps").first().id,
+                                    relation_type="синоним"),
+
+                # MiniApps связан с MP как "синоним"
+                TermRelationshipModel(from_term_id=db.query(TermModel).filter(TermModel.name == "MiniApps").first().id,
+                                    to_term_id=db.query(TermModel).filter(TermModel.name == "MP").first().id,
+                                    relation_type="синоним"),
+
+                # HTML связан с js как "используется с"
+                TermRelationshipModel(from_term_id=db.query(TermModel).filter(TermModel.name == "HTML").first().id,
+                                    to_term_id=db.query(TermModel).filter(TermModel.name == "js").first().id,
+                                    relation_type="используется с"),
+
+                # js связан с HTML как "используется с"
+                TermRelationshipModel(from_term_id=db.query(TermModel).filter(TermModel.name == "js").first().id,
+                                    to_term_id=db.query(TermModel).filter(TermModel.name == "HTML").first().id,
+                                    relation_type="используется с"),
+
+                # MP связан с HTML как "технология веб-разработки"
+                TermRelationshipModel(from_term_id=db.query(TermModel).filter(TermModel.name == "MP").first().id,
+                                    to_term_id=db.query(TermModel).filter(TermModel.name == "HTML").first().id,
+                                    relation_type="технология веб-разработки"),
+            ]
+
+            for relation in initial_relations:
+                db.add(relation)
+            db.commit()
+
+            print("База данных инициализирована начальными данными и связями")
     finally:
         db.close()
 
@@ -60,6 +143,15 @@ init_database()
 app = FastAPI(title="Глоссарий терминов ВКР",
               description="API для управления глоссарием терминов ВКР",
               version="1.0.0")
+
+# Настройка CORS для разрешения запросов с фронтенда
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5500", "http://127.0.0.1:5500"],  # Разрешаем ваш фронтенд
+    allow_credentials=True,
+    allow_methods=["*"],  # Разрешаем все методы
+    allow_headers=["*"],  # Разрешаем все заголовки
+)
 
 # Зависимость для получения сессии базы данных
 def get_db():
@@ -97,6 +189,48 @@ def create_term(term: Term, db: Session = Depends(get_db)):
     db.refresh(db_term)
     return db_term
 
+
+@app.post("/terms/{term_name}/relations", response_model=List[TermRelationResponse])
+def add_term_relation(term_name: str, relation: TermRelationCreate, db: Session = Depends(get_db)):
+    """Добавить семантическую связь между терминами"""
+    from_term = db.query(TermModel).filter(TermModel.name == term_name).first()
+    to_term = db.query(TermModel).filter(TermModel.name == relation.target_name).first()
+
+    if not from_term or not to_term:
+        raise HTTPException(status_code=404, detail="Один или оба термина не найдены")
+
+    # Проверяем наличие такой же связи
+    existing_relation = (
+        db.query(TermRelationshipModel)
+        .filter(
+            TermRelationshipModel.from_term_id == from_term.id,
+            TermRelationshipModel.to_term_id == to_term.id,
+            TermRelationshipModel.relation_type == relation.relation_type,
+        )
+        .first()
+    )
+    if existing_relation:
+        raise HTTPException(status_code=400, detail="Такая связь уже существует")
+
+    db_relation = TermRelationshipModel(
+        from_term_id=from_term.id,
+        to_term_id=to_term.id,
+        relation_type=relation.relation_type,
+    )
+    db.add(db_relation)
+    db.commit()
+    db.refresh(from_term)
+    return from_term.relations
+
+
+@app.get("/terms/{term_name}/relations", response_model=List[TermRelationResponse])
+def get_term_relations(term_name: str, db: Session = Depends(get_db)):
+    """Получить семантические связи для указанного термина"""
+    term = db.query(TermModel).filter(TermModel.name == term_name).first()
+    if not term:
+        raise HTTPException(status_code=404, detail="Термин не найден")
+    return term.relations
+
 @app.put("/terms/{term_name}", response_model=TermResponse)
 def update_term(term_name: str, term_update: TermUpdate, db: Session = Depends(get_db)):
     """Обновить существующий термин"""
@@ -115,6 +249,11 @@ def delete_term(term_name: str, db: Session = Depends(get_db)):
     term = db.query(TermModel).filter(TermModel.name == term_name).first()
     if not term:
         raise HTTPException(status_code=404, detail="Термин не найден")
+
+    # Удаляем все связи, где термин участвует
+    db.query(TermRelationshipModel).filter(
+        or_(TermRelationshipModel.from_term_id == term.id, TermRelationshipModel.to_term_id == term.id)
+    ).delete(synchronize_session=False)
 
     db.delete(term)
     db.commit()
